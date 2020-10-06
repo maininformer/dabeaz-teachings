@@ -1,9 +1,37 @@
 from socket import *
 from fib import fib
 from threading import Thread
-from concurrent.futures import ProcessPoolExecutor as Pool
+from collections import deque
+from select import select
 
-pool = Pool(4)
+tasks = deque()
+recv_wait = {}  # mapping sockets to tasks(generators)
+send_wait = {}
+
+def run():
+    while any([tasks, recv_wait, send_wait]):
+        while not tasks:
+            # no active tasks to run
+            # wait for I/O
+            can_recv, can_send, [] = select(recv_wait, send_wait, [])
+            for s in can_recv:
+                tasks.append(recv_wait.pop(s))
+            for s in can_send:
+                tasks.append(send_wait.pop(s))
+
+        task = tasks.popleft()
+        try:
+            why, what = next(task)  # run to yield
+            # must go wait
+            if why == 'recv':
+                recv_wait[what] = task
+            elif why == 'send':
+                send_wait[what] = task
+            else:
+                raise RunTimeError
+
+        except StopIteration:
+            print("task is done")
 
 def fib_server(address):
     sock = socket(AF_INET, SOCK_STREAM)
@@ -12,26 +40,25 @@ def fib_server(address):
     sock.listen(5)
     while True:
         # accept() blocks
-        client, addr = sock.accept()
+        yield 'recv', sock
+        client, addr = sock.accept()  # blocking
         print("Connection", addr)
-        Thread(target=fib_handler, args=(client,), daemon=True).start()
+        tasks.append(fib_handler(client))
 
 
 def fib_handler(client):
     while True:
-        req = client.recv(100)
+        yield 'recv', client
+        req = client.recv(100)  # blocking
         if not req:
             break
         n = int(req)
-        # just calling fib(n): around 37K req/sec
-        # result = fib(n)
-
-        # pool of 4: around 2K req/sec
-        future = pool.submit(fib, n)
-        result = future.result()
+        result = fib(n)
         resp = str(result).encode('ascii') + b'\n'
-        client.send(resp)
+        yield 'send', client
+        client.send(resp)  # blocking
     print("Closed")
 
 if __name__ == '__main__':
-    fib_server(('', 25000))
+    tasks.append(fib_server(('', 25000)))
+    run()
